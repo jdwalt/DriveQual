@@ -5,6 +5,41 @@
 
 > **DATA LOSS WARNING:** `sudo drivequal /dev/sdX` overwrites the selected **entire physical disk**, starting with a destructive 4 KiB probe. It destroys the existing partition table and files. `sdX` can change between boots or swaps. Never run it on a drive containing data you intend to retain. This tool requires root and assumes you have already decided the entire target may be erased.
 
+## Quick start: installation for beginners
+
+These instructions are for Debian 13 or a compatible Linux system. Install dependencies while connected to the internet. DriveQual can subsequently operate offline.
+
+### 1. Download DriveQual
+
+```bash
+sudo apt update
+sudo apt install git
+
+git clone https://github.com/jdwalt/DriveQual.git
+cd DriveQual
+```
+
+### 2. Install dependencies
+
+```bash
+sudo apt install smartmontools hdparm jq util-linux \
+  coreutils gawk fdisk parted f3 lm-sensors procps systemd
+```
+
+The `f3` package is only required for experimental USB-flash testing.
+
+### 3. Test and install
+
+```bash
+bash tests/smoke.sh
+sudo bash install.sh
+drivequal --version
+```
+
+Expected version: `drivequal 2.2.0-rc1`.
+
+**Warning:** Installation does not erase any drives. Running `sudo drivequal sdb` begins destructive qualification of the selected physical disk. Identify the correct disk before running it. See the operator workflow below.
+
 ## Supported media
 
 | Profile | Current process | Status |
