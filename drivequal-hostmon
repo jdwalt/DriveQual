@@ -1,0 +1,255 @@
+#!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+set -uo pipefail
+
+VERSION="2.2.0-rc1"
+RUNDIR=/run/drivequal
+STATEDIR="$RUNDIR/state"
+LOCKFILE="$RUNDIR/hostmon.lock"
+LOGDIR=/drivequal/host-monitor
+INTERVAL=60
+INHIBIT_PID=""
+
+mkdir -p "$STATEDIR" "$LOGDIR"
+
+exec 9>"$LOCKFILE"
+if ! flock -n 9; then
+    exit 0
+fi
+
+cleanup_states() {
+    local f pid cmd
+    for f in "$STATEDIR"/*.state; do
+        [[ -e "$f" ]] || continue
+        pid="$(awk -F= '$1=="pid" {print $2; exit}' "$f" 2>/dev/null || true)"
+        if [[ -z "$pid" || ! -d "/proc/$pid" ]]; then
+            rm -f "$f"
+            continue
+        fi
+        cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+        if [[ "$cmd" != *drivequal* || "$cmd" == *drivequal-hostmon* || "$cmd" == *drivequal-status* ]]; then
+            rm -f "$f"
+        fi
+    done
+}
+
+active_count() {
+    cleanup_states
+    find "$STATEDIR" -maxdepth 1 -type f -name '*.state' -print 2>/dev/null | wc -l
+}
+
+field() {
+    local file="$1" key="$2"
+    awk -F= -v k="$key" '$1==k {sub(/^[^=]*=/,""); print; exit}' "$file" 2>/dev/null
+}
+
+pkg_temp() {
+    local t
+    t="$(sensors 2>/dev/null | awk '
+        /Package id 0:/ {v=$4; gsub(/[^0-9.]/,"",v); print v; exit}
+    ')"
+    if [[ -z "$t" ]]; then
+        t="$(sensors 2>/dev/null | awk '
+            /Core [0-9]+:/ {v=$3; gsub(/[^0-9.]/,"",v); if (v+0 > max) max=v+0}
+            END {if (max != "") print max}
+        ')"
+    fi
+    [[ -z "$t" ]] && t="NA"
+    printf '%s\n' "$t"
+}
+
+snapshot() {
+    echo "--- uptime ---"
+    uptime
+    echo "--- memory ---"
+    free -h
+    echo "--- sensors ---"
+    sensors 2>/dev/null || true
+    echo "--- drivequal filesystem ---"
+    df -h /drivequal
+    echo "--- block devices (start/end only) ---"
+    lsblk -o NAME,MODEL,SERIAL,SIZE,ROTA,TRAN,MOUNTPOINTS
+    echo "--- busiest processes ---"
+    ps -eo pid,comm,%cpu,%mem --sort=-%cpu | head -10
+}
+
+cleanup() {
+    if [[ -n "$INHIBIT_PID" ]] && kill -0 "$INHIBIT_PID" 2>/dev/null; then
+        kill "$INHIBIT_PID" 2>/dev/null || true
+        wait "$INHIBIT_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM HUP
+
+# A qualifier registers before launching us. Allow a tiny race margin.
+QUALS="$(active_count)"
+if (( QUALS == 0 )); then
+    sleep 2
+    QUALS="$(active_count)"
+    (( QUALS > 0 )) || exit 0
+fi
+
+if command -v systemd-inhibit >/dev/null 2>&1; then
+    systemd-inhibit \
+        --what=sleep:idle \
+        --mode=block \
+        --who=drivequal \
+        --why="Drive qualification batch active" \
+        sleep infinity 9>&- >/dev/null 2>&1 &
+    INHIBIT_PID=$!
+    sleep 0.2
+    if ! kill -0 "$INHIBIT_PID" 2>/dev/null; then
+        INHIBIT_PID=""
+    fi
+fi
+
+STAMP="$(date '+%Y-%m-%d_%H%M%S')"
+LOG="$LOGDIR/${STAMP}__host.log"
+CSV="$LOGDIR/${STAMP}__host.csv"
+DRIVECSV="$LOGDIR/${STAMP}__drives.csv"
+
+printf 'timestamp,quals,pkg_temp_c,load1,load5,load15,mem_used_mib,mem_avail_mib,swap_used_mib,iowait_pct,drivequal_use_pct\n' > "$CSV"
+printf 'timestamp,device,media,model,serial,stage,temp_c\n' > "$DRIVECSV"
+
+{
+    echo "============================================================"
+    echo "DRIVEQUAL HOST MONITOR v$VERSION START"
+    echo "Started: $(date --iso-8601=seconds)"
+    echo "Host: $(hostname)"
+    echo "Kernel: $(uname -r)"
+    echo "Interval: ${INTERVAL}s"
+    echo "Host CSV: $CSV"
+    echo "Drive CSV: $DRIVECSV"
+    echo "============================================================"
+    snapshot
+} >> "$LOG"
+
+LAST_WARN_TIME="$(date --iso-8601=seconds)"
+
+while true; do
+    QUALS="$(active_count)"
+    if (( QUALS == 0 )); then
+        break
+    fi
+
+    NOW="$(date --iso-8601=seconds)"
+    TEMP="$(pkg_temp)"
+    read -r LOAD1 LOAD5 LOAD15 _ < /proc/loadavg
+
+    MEM_TOTAL_KB="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
+    MEM_AVAIL_KB="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
+    MEM_USED_MIB=$(( (MEM_TOTAL_KB - MEM_AVAIL_KB) / 1024 ))
+    MEM_AVAIL_MIB=$(( MEM_AVAIL_KB / 1024 ))
+
+    SWAP_TOTAL_KB="$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)"
+    SWAP_FREE_KB="$(awk '/^SwapFree:/ {print $2}' /proc/meminfo)"
+    SWAP_USED_MIB=$(( (SWAP_TOTAL_KB - SWAP_FREE_KB) / 1024 ))
+
+    VM="$(vmstat 1 2 | tail -1)"
+    IOWAIT="$(awk '{print $16}' <<<"$VM")"
+    DQ_USE="$(df -P /drivequal | awk 'NR==2 {gsub(/%/,"",$5); print $5}')"
+
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+        "$NOW" "$QUALS" "$TEMP" "$LOAD1" "$LOAD5" "$LOAD15" \
+        "$MEM_USED_MIB" "$MEM_AVAIL_MIB" "$SWAP_USED_MIB" "$IOWAIT" "$DQ_USE" \
+        >> "$CSV"
+
+    if [[ "$TEMP" == "NA" ]]; then HOST_TEMP_SHOW="NA"; else HOST_TEMP_SHOW="${TEMP}C"; fi
+    printf '%s HOST quals=%s pkg=%s load=%s/%s/%s mem=%sMiB-used/%sMiB-avail swap=%sMiB iowait=%s%% dq=%s%%\n' \
+        "$NOW" "$QUALS" "$HOST_TEMP_SHOW" "$LOAD1" "$LOAD5" "$LOAD15" \
+        "$MEM_USED_MIB" "$MEM_AVAIL_MIB" "$SWAP_USED_MIB" "$IOWAIT" "$DQ_USE" \
+        >> "$LOG"
+
+    for f in "$STATEDIR"/*.state; do
+        [[ -e "$f" ]] || continue
+        DEVICE="$(field "$f" device)"
+        MEDIA="$(field "$f" media)"
+        MODEL="$(field "$f" model)"
+        SERIAL="$(field "$f" serial)"
+        STAGE="$(field "$f" stage)"
+        TEMPFILE="$(field "$f" temp_file)"
+        DTEMP="NA"
+        if [[ -n "$TEMPFILE" && -f "$TEMPFILE" ]]; then
+            DTEMP="$(field "$TEMPFILE" temp_c)"
+            [[ -z "$DTEMP" ]] && DTEMP="NA"
+        fi
+
+        printf '%s,%s,%s,"%s",%s,%s,%s\n' \
+            "$NOW" "$DEVICE" "$MEDIA" "${MODEL//\"/\"\"}" "$SERIAL" "$STAGE" "$DTEMP" \
+            >> "$DRIVECSV"
+
+        if [[ "$DTEMP" == "NA" ]]; then DRIVE_TEMP_SHOW="NA"; else DRIVE_TEMP_SHOW="${DTEMP}C"; fi
+        printf '%s DRIVE dev=%s media=%s model=%s serial=%s stage=%s temp=%s\n' \
+            "$NOW" "$(basename "$DEVICE")" "$MEDIA" "$MODEL" "$SERIAL" "$STAGE" "$DRIVE_TEMP_SHOW" \
+            >> "$LOG"
+    done
+
+    WARNINGS="$(journalctl -k --since "$LAST_WARN_TIME" -p warning..alert --no-pager 2>/dev/null | sed '/^-- No entries --$/d' || true)"
+    LAST_WARN_TIME="$NOW"
+    if [[ -n "$WARNINGS" ]]; then
+        {
+            echo "--- NEW KERNEL WARNING(S) @ $NOW ---"
+            echo "$WARNINGS"
+        } >> "$LOG"
+    fi
+
+    sleep "$INTERVAL"
+done
+
+END_TIME="$(date --iso-8601=seconds)"
+
+{
+    echo
+    echo "============================================================"
+    echo "DRIVEQUAL HOST MONITOR END"
+    echo "Completed: $END_TIME"
+    echo "============================================================"
+    snapshot
+    echo
+    echo "--- RUN SUMMARY ---"
+    awk -F, '
+        NR==1 {next}
+        {
+            if ($3 != "NA" && ($3+0 > max_temp || !seen_temp)) {max_temp=$3+0; seen_temp=1}
+            if ($4+0 > max_load1 || !seen_load) {max_load1=$4+0; seen_load=1}
+            if ($7+0 > max_mem || !seen_mem) {max_mem=$7+0; seen_mem=1}
+            if ($9+0 > max_swap || !seen_swap) {max_swap=$9+0; seen_swap=1}
+            if ($10+0 > max_iowait || !seen_io) {max_iowait=$10+0; seen_io=1}
+            if ($11+0 > max_dq || !seen_dq) {max_dq=$11+0; seen_dq=1}
+            n++
+        }
+        END {
+            printf "Samples: %d\n", n
+            if (seen_temp) printf "Max package/core temp: %.1f C\n", max_temp
+            if (seen_load) printf "Max 1-minute load: %.2f\n", max_load1
+            if (seen_mem) printf "Max memory used: %d MiB\n", max_mem
+            if (seen_swap) printf "Max swap used: %d MiB\n", max_swap
+            if (seen_io) printf "Max IO wait: %d%%\n", max_iowait
+            if (seen_dq) printf "Max /drivequal use: %d%%\n", max_dq
+        }
+    ' "$CSV"
+    echo
+    echo "--- MAX DRIVE TEMPERATURES ---"
+    awk -F, '
+        NR==1 {next}
+        $7 ~ /^[0-9]+([.][0-9]+)?$/ {
+            key=$5 "|" $2 "|" $4
+            if (!(key in seen) || $7+0 > max[key]) max[key]=$7+0
+            seen[key]=1
+        }
+        END {
+            for (k in seen) {
+                split(k,a,"|")
+                printf "%s %s %s: %.1f C\n", a[2], a[1], a[3], max[k]
+            }
+        }
+    ' "$DRIVECSV"
+    echo "Host CSV: $CSV"
+    echo "Drive CSV: $DRIVECSV"
+    echo "Log: $LOG"
+} >> "$LOG"
+
+if [[ -n "${SUDO_USER:-}" ]]; then
+    chown "$SUDO_USER":"$SUDO_USER" "$LOG" "$CSV" "$DRIVECSV" 2>/dev/null || true
+fi

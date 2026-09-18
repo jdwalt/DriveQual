@@ -1,0 +1,101 @@
+#!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+set -uo pipefail
+
+VERSION="2.2.0-rc1"
+STATEDIR=/run/drivequal/state
+INTERVAL="${1:-10}"
+SEEN_ACTIVE=0
+
+if ! [[ "$INTERVAL" =~ ^[0-9]+$ ]] || (( INTERVAL < 1 )); then
+    echo "Usage: drivequal-status [refresh-seconds]" >&2
+    exit 1
+fi
+
+field() {
+    local file="$1" key="$2"
+    awk -F= -v k="$key" '$1==k {sub(/^[^=]*=/,""); print; exit}' "$file" 2>/dev/null
+}
+
+pkg_temp() {
+    local t
+    t="$(sensors 2>/dev/null | awk '
+        /Package id 0:/ {v=$4; gsub(/[^0-9.]/,"",v); print v; exit}
+    ')"
+    if [[ -z "$t" ]]; then
+        t="$(sensors 2>/dev/null | awk '
+            /Core [0-9]+:/ {v=$3; gsub(/[^0-9.]/,"",v); if (v+0 > max) max=v+0}
+            END {if (max != "") print max}
+        ')"
+    fi
+    [[ -z "$t" ]] && t="NA"
+    printf '%s\n' "$t"
+}
+
+while true; do
+    # Collect the complete next frame first.  The existing dashboard stays
+    # visible while vmstat and sensors are sampled, avoiding a blank flash.
+    mapfile -t STATES < <(find "$STATEDIR" -maxdepth 1 -type f -name '*.state' -print 2>/dev/null | sort)
+    QUALS=${#STATES[@]}
+    (( QUALS > 0 )) && SEEN_ACTIVE=1
+
+    NOW="$(date '+%Y-%m-%d %I:%M:%S %p %Z')"
+    TEMP="$(pkg_temp)"
+    read -r LOAD1 LOAD5 LOAD15 _ < /proc/loadavg
+    MEM_TOTAL_KB="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
+    MEM_AVAIL_KB="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
+    MEM_USED_MIB=$(( (MEM_TOTAL_KB - MEM_AVAIL_KB) / 1024 ))
+    MEM_AVAIL_MIB=$(( MEM_AVAIL_KB / 1024 ))
+    SWAP_TOTAL_KB="$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)"
+    SWAP_FREE_KB="$(awk '/^SwapFree:/ {print $2}' /proc/meminfo)"
+    SWAP_USED_MIB=$(( (SWAP_TOTAL_KB - SWAP_FREE_KB) / 1024 ))
+    VM="$(vmstat 1 2 | tail -1)"
+    IOWAIT="$(awk '{print $16}' <<<"$VM")"
+    DQ_USE="$(df -P /drivequal | awk 'NR==2 {print $5}')"
+
+    # Only now replace the old frame.
+    printf '\033[H\033[2J'
+    echo "DRIVEQUAL LIVE STATUS v$VERSION"
+    echo "$NOW"
+    echo
+    echo "HOST"
+    if [[ "$TEMP" == "NA" ]]; then HTEMP="NA"; else HTEMP="${TEMP}C"; fi
+    printf '  CPU pkg/core: %s    Load: %s %s %s    IO wait: %s%%\n' "$HTEMP" "$LOAD1" "$LOAD5" "$LOAD15" "$IOWAIT"
+    printf '  RAM: %s MiB used / %s MiB available    Swap: %s MiB    /drivequal: %s used\n' \
+        "$MEM_USED_MIB" "$MEM_AVAIL_MIB" "$SWAP_USED_MIB" "$DQ_USE"
+    echo
+
+    echo "ACTIVE QUALIFIERS: $QUALS"
+    if (( QUALS > 0 )); then
+        printf '%-5s %-6s %-25s %-22s %-12s %6s\n' "DEV" "MEDIA" "MODEL" "SERIAL" "STAGE" "TEMP"
+        printf '%-5s %-6s %-25s %-22s %-12s %6s\n' "-----" "------" "-------------------------" "----------------------" "------------" "------"
+        for f in "${STATES[@]}"; do
+            DEVICE="$(field "$f" device)"
+            MEDIA="$(field "$f" media)"
+            MODEL="$(field "$f" model)"
+            SERIAL="$(field "$f" serial)"
+            STAGE="$(field "$f" stage)"
+            TEMPFILE="$(field "$f" temp_file)"
+            DTEMP="NA"
+            if [[ -n "$TEMPFILE" && -f "$TEMPFILE" ]]; then
+                DTEMP="$(field "$TEMPFILE" temp_c)"
+                [[ -z "$DTEMP" ]] && DTEMP="NA"
+            fi
+            if [[ "$DTEMP" == "NA" ]]; then DSHOW="NA"; else DSHOW="${DTEMP}C"; fi
+            printf '%-5s %-6s %-25.25s %-22.22s %-12s %6s\n' \
+                "$(basename "$DEVICE")" "$MEDIA" "$MODEL" "$SERIAL" "$STAGE" "$DSHOW"
+        done
+        echo
+        echo "Refresh: ${INTERVAL}s. Ctrl-C closes this dashboard only; qualifiers keep running."
+    else
+        if (( SEEN_ACTIVE == 1 )); then
+            echo "Batch complete. No qualifiers remain active."
+            exit 0
+        else
+            echo "No qualifiers are currently active."
+            exit 0
+        fi
+    fi
+
+    sleep "$INTERVAL"
+done

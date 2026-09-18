@@ -1,0 +1,1391 @@
+#!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+set -uo pipefail
+
+VERSION="2.2.0-rc1"
+RUNDIR=/run/drivequal
+STATEDIR="$RUNDIR/state"
+TEMPDIR="$RUNDIR/temp"
+LOCKDIR="$RUNDIR/locks"
+HOSTMON=/usr/local/sbin/drivequal-hostmon
+
+usage() {
+    cat <<USAGE
+Usage: sudo drivequal <disk>
+       drivequal --version
+
+Examples:
+  sudo drivequal sda
+  sudo drivequal /dev/sdb
+
+Launching drivequal authorizes destructive qualification of the
+specified WHOLE DISK after automatic identity, mount, security,
+and health gates.
+USAGE
+}
+
+if [[ "${1:-}" == "--version" ]]; then
+    echo "drivequal $VERSION"
+    exit 0
+fi
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    usage
+    exit 0
+fi
+
+if [[ $EUID -ne 0 ]]; then
+    echo "ERROR: Run with sudo, for example: sudo drivequal sda" >&2
+    exit 1
+fi
+
+if [[ $# -ne 1 ]]; then
+    usage >&2
+    exit 1
+fi
+
+for cmd in lsblk blockdev findmnt flock sha256sum smartctl jq dd cmp tee udevadm fdisk wipefs partprobe hdparm; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "ERROR: Required command is missing: $cmd" >&2
+        exit 1
+    fi
+done
+
+mkdir -p "$STATEDIR" "$TEMPDIR" "$LOCKDIR"
+
+NAME="${1#/dev/}"
+DEV="/dev/$NAME"
+
+if [[ ! -b "$DEV" ]]; then
+    echo "ERROR: $DEV is not a block device." >&2
+    exit 1
+fi
+
+if [[ "$(lsblk -dn -o TYPE "$DEV" 2>/dev/null)" != "disk" ]]; then
+    echo "ERROR: $DEV is not a whole disk." >&2
+    exit 1
+fi
+
+DEV="$(readlink -f "$DEV")"
+NAME="$(basename "$DEV")"
+
+# ------------------------------------------------------------
+# Protect the running OS disk. Check /, /boot, and /boot/efi.
+# ------------------------------------------------------------
+for MP in / /boot /boot/efi; do
+    SRC="$(findmnt -n -o SOURCE "$MP" 2>/dev/null || true)"
+    [[ -b "$SRC" ]] || continue
+    if lsblk -sno PATH "$SRC" 2>/dev/null | grep -Fxq "$DEV"; then
+        echo "REFUSING: $DEV contains part of the running operating system." >&2
+        exit 1
+    fi
+done
+
+MODEL="$(lsblk -dn -o MODEL "$DEV" | xargs)"
+SERIAL="$(lsblk -dn -o SERIAL "$DEV" | xargs)"
+SIZE="$(lsblk -dn -o SIZE "$DEV" | xargs)"
+BYTES="$(blockdev --getsize64 "$DEV")"
+TRAN="$(lsblk -dn -o TRAN "$DEV" | xargs)"
+ROTA="$(lsblk -dn -o ROTA "$DEV" | xargs)"
+
+case "$TRAN:$ROTA" in
+    sata:1) MEDIA="HDD" ;;
+    sata:0) MEDIA="SSD" ;;
+    usb:0)  MEDIA="USB" ;;
+    *)
+        echo "REFUSING: unsupported transport/media: ${TRAN:-unknown}/rotational=${ROTA:-unknown}." >&2
+        echo "This release supports direct SATA HDD/SSD and USB flash media only." >&2
+        exit 4
+        ;;
+esac
+
+# ------------------------------------------------------------
+# Resolve the device through by-id. A by-path-only fallback is unsafe:
+# an indistinguishable replacement on the same port could be overwritten.
+# ------------------------------------------------------------
+BYID=""
+for PREFIX in ata nvme usb scsi wwn; do
+    for ID in /dev/disk/by-id/${PREFIX}-*; do
+        [[ -L "$ID" ]] || continue
+        [[ "$ID" == *-part* ]] && continue
+        if [[ "$(readlink -f "$ID")" == "$DEV" ]]; then
+            BYID="$ID"
+            break 2
+        fi
+    done
+done
+
+if [[ -z "$BYID" ]]; then
+    echo "REFUSING: no stable /dev/disk/by-id identity exists for $DEV." >&2
+    echo "A /dev/disk/by-path port is not a unique drive identity." >&2
+    exit 4
+fi
+
+# A USB port path does not identify an individual flash device.  Two flash
+# devices can report the same model and capacity; hot-swapping them mid-run
+# cannot be proven safe with this fallback.  Refuse ambiguous USB identity.
+if [[ "$TRAN" == "usb" ]]; then
+    if [[ -z "$SERIAL" ]]; then
+        echo "REFUSING: USB device lacks a serial-backed by-id identity." >&2
+        echo "Use a device with a unique reported serial; port identity alone is unsafe." >&2
+        exit 4
+    fi
+    # Reject duplicate serials visible on separate USB disks (common on
+    # low-cost flash drives).  This check also covers mistaken USB adapters.
+    if [[ "$(lsblk -dn -o SERIAL,TRAN | awk -v sn="$SERIAL" '$2=="usb" && $1==sn {n++} END {print n+0}')" -ne 1 ]]; then
+        echo "REFUSING: USB serial '$SERIAL' is not unique among attached USB disks." >&2
+        exit 4
+    fi
+fi
+
+IDENTITY="${SERIAL:-$(basename "$BYID")}" 
+SAFE_ID="$(printf '%s' "$IDENTITY" | tr ' /:' '___' | tr -cd '[:alnum:]_.-')"
+[[ -z "$SAFE_ID" ]] && SAFE_ID="device"
+
+# ------------------------------------------------------------
+# One active qualifier per durable physical identity.
+# ------------------------------------------------------------
+LOCKKEY="$(printf '%s' "$BYID" | sha256sum | awk '{print substr($1,1,20)}')"
+LOCKFILE="$LOCKDIR/$LOCKKEY.lock"
+exec 8>"$LOCKFILE"
+
+if ! flock -n 8; then
+    echo >&2
+    echo "************************************************************" >&2
+    echo " REFUSING DUPLICATE QUALIFICATION RUN" >&2
+    echo " A drivequal process is already active for this drive." >&2
+    echo "************************************************************" >&2
+    echo "Device:    $DEV" >&2
+    echo "Model:     $MODEL" >&2
+    echo "Serial:    ${SERIAL:-unavailable}" >&2
+    echo "Stable ID: $BYID" >&2
+    echo "Do not start another qualifier until the existing run exits." >&2
+    exit 4
+fi
+
+# ------------------------------------------------------------
+# Human metadata. Date confirmation stays even when NTP is up.
+# ------------------------------------------------------------
+echo
+echo "============================================================"
+echo " DRIVE QUALIFICATION v$VERSION"
+echo "============================================================"
+echo
+echo "Device:    $DEV"
+echo "Model:     $MODEL"
+echo "Serial:    ${SERIAL:-unavailable}"
+echo "Size:      $SIZE"
+echo "Bytes:     $BYTES"
+echo "Transport: ${TRAN:-unknown}"
+echo "Media:     $MEDIA"
+echo "Stable ID: $BYID"
+echo
+echo "System time:"
+date '+%Y-%m-%d %I:%M:%S %p %Z'
+echo
+
+read -r -p "Is this time correct? [Y/n]: " TIME_OK
+TIME_OK="${TIME_OK:-Y}"
+case "$TIME_OK" in
+    Y|y|YES|Yes|yes) ;;
+    *)
+        echo "Stopping. Correct the system clock and run again."
+        exit 1
+        ;;
+esac
+
+read -r -p "Source [OSUSED]: " SOURCE
+SOURCE="${SOURCE:-OSUSED}"
+SOURCE="$(echo "$SOURCE" | tr ' /' '__' | tr -cd '[:alnum:]_.-')"
+[[ -z "$SOURCE" ]] && SOURCE="OSUSED"
+
+# ------------------------------------------------------------
+# Refuse any mounted target or target partition.
+# ------------------------------------------------------------
+MOUNTS="$(lsblk -nr -o MOUNTPOINTS "$DEV" | sed '/^$/d')"
+if [[ -n "$MOUNTS" ]]; then
+    echo >&2
+    echo "REFUSING: Target or one of its partitions is mounted:" >&2
+    echo "$MOUNTS" >&2
+    exit 1
+fi
+
+# ------------------------------------------------------------
+# Session structure.
+# ------------------------------------------------------------
+STAMP="$(date '+%Y-%m-%d_%H%M%S')"
+mkdir -p /drivequal/active
+# Unique session names prevent an accidental merge with an old run when the
+# clock was reset or two identical-ID devices started in the same second.
+SESSION="$(mktemp -d "/drivequal/active/${STAMP}__${SOURCE}__${SAFE_ID}__XXXXXX")" || {
+    echo "ERROR: Could not create an exclusive session directory." >&2
+    exit 1
+}
+BASENAME="$(basename "$SESSION")"
+
+mkdir -p \
+    "$SESSION/baseline" \
+    "$SESSION/probe" \
+    "$SESSION/long-test" \
+    "$SESSION/zero-write" \
+    "$SESSION/readback" \
+    "$SESSION/short-test" \
+    "$SESSION/final"
+
+SESSION_LOG="$SESSION/session.log"
+TEMPLOG="$SESSION/temperature.csv"
+STAGEFILE="$SESSION/.stage"
+STATEFILE="$STATEDIR/${BASENAME}__$$.state"
+TEMPSTATE="$TEMPDIR/${BASENAME}__$$.temp"
+TEMP_PID=""
+STAGE="INIT"
+FINALIZED=0
+SMART_CAPABLE=0
+F3_PASSED=0
+LONG_RAN=0
+LONG_VALID=0
+SHORT_RAN=0
+SHORT_VALID=0
+REVIEW_ADVISORY=0
+declare -a ADVISORIES=()
+
+exec > >(tee -a "$SESSION_LOG") 2>&1
+
+# ------------------------------------------------------------
+# Runtime state / telemetry helpers.
+# ------------------------------------------------------------
+write_state() {
+    local tmp="${STATEFILE}.tmp.$$"
+    {
+        echo "pid=$$"
+        echo "key=$LOCKKEY"
+        echo "device=$DEV"
+        echo "stable_id=$BYID"
+        echo "model=$MODEL"
+        echo "serial=${SERIAL:-unavailable}"
+        echo "media=$MEDIA"
+        echo "stage=$STAGE"
+        echo "session=$SESSION"
+        echo "temp_file=$TEMPSTATE"
+        echo "started=$STAMP"
+    } > "$tmp"
+    mv -f "$tmp" "$STATEFILE"
+}
+
+set_stage() {
+    STAGE="$1"
+    printf '%s\n' "$STAGE" > "$STAGEFILE"
+    write_state
+}
+
+get_temp() {
+    local json t=""
+
+    json="$(smartctl -A -j "$BYID" 2>/dev/null || true)"
+    if [[ -n "$json" ]]; then
+        t="$(jq -r '.temperature.current // empty' <<<"$json" 2>/dev/null | head -n1)"
+    fi
+
+    if [[ -z "$t" ]]; then
+        json="$(smartctl -x -j "$BYID" 2>/dev/null || true)"
+        if [[ -n "$json" ]]; then
+            t="$(jq -r '.temperature.current // empty' <<<"$json" 2>/dev/null | head -n1)"
+        fi
+    fi
+
+    if [[ -z "$t" ]]; then
+        t="$(smartctl -A "$BYID" 2>/dev/null | awk '
+            /Temperature_Celsius|Airflow_Temperature_Cel/ {print $10; exit}
+            /Current Drive Temperature:/ {for (i=1;i<=NF;i++) if ($i ~ /^[0-9]+$/) {print $i; exit}}
+        ')"
+    fi
+
+    [[ -z "$t" ]] && t="NA"
+    printf '%s\n' "$t"
+}
+
+update_temp_state() {
+    local now="$1" temp="$2" tmp="${TEMPSTATE}.tmp.${BASHPID}"
+    {
+        echo "timestamp=$now"
+        echo "temp_c=$temp"
+    } > "$tmp"
+    mv -f "$tmp" "$TEMPSTATE"
+}
+
+record_temp_once() {
+    local now temp stage
+    [[ "$SMART_CAPABLE" -eq 1 ]] || return 0
+    stage="$(cat "$STAGEFILE" 2>/dev/null || echo "$STAGE")"
+    now="$(date --iso-8601=seconds)"
+    temp="$(get_temp)"
+    printf '%s,%s,%s\n' "$now" "$stage" "$temp" >> "$TEMPLOG"
+    update_temp_state "$now" "$temp"
+}
+
+temperature_logger() {
+    # Do not let the background telemetry worker keep the drive lock alive.
+    exec 8>&-
+    while [[ -f "$STATEFILE" ]]; do
+        sleep 60
+        [[ -f "$STATEFILE" ]] || break
+        record_temp_once
+    done
+}
+
+start_temp_logger() {
+    [[ "$SMART_CAPABLE" -eq 1 ]] || return 0
+    if [[ -z "$TEMP_PID" ]]; then
+        printf 'timestamp,stage,temp_c\n' > "$TEMPLOG"
+        record_temp_once
+        temperature_logger >/dev/null 2>&1 &
+        TEMP_PID=$!
+    fi
+}
+
+stop_temp_logger() {
+    if [[ -n "$TEMP_PID" ]] && kill -0 "$TEMP_PID" 2>/dev/null; then
+        kill "$TEMP_PID" 2>/dev/null || true
+        wait "$TEMP_PID" 2>/dev/null || true
+    fi
+    TEMP_PID=""
+}
+
+stage_temp_summary() {
+    local stage="$1" outfile="$2"
+    local summary
+
+    if [[ ! -s "$TEMPLOG" ]]; then
+        summary="$stage temperature: unavailable"
+    else
+        summary="$(awk -F, -v s="$stage" '
+            NR > 1 && $2 == s && $3 ~ /^[0-9]+([.][0-9]+)?$/ {
+                v=$3+0
+                if (!n) {start=v; min=v; max=v}
+                if (v < min) min=v
+                if (v > max) max=v
+                end=v
+                n++
+            }
+            END {
+                if (n) printf "%s temperature: start=%gC min=%gC max=%gC end=%gC samples=%d", s,start,min,max,end,n
+                else printf "%s temperature: unavailable", s
+            }
+        ' "$TEMPLOG")"
+    fi
+
+    echo "$summary" | tee "$outfile"
+}
+
+add_review_advisory() {
+    local msg="$*"
+    REVIEW_ADVISORY=1
+    ADVISORIES+=("$msg")
+    echo
+    echo "************************************************************"
+    echo " WARNING / REVIEW ADVISORY"
+    echo " $msg"
+    echo " Qualification will continue unless another gate fails."
+    echo "************************************************************"
+    echo
+}
+
+write_advisories() {
+    if (( ${#ADVISORIES[@]} > 0 )); then
+        : > "$SESSION/final/advisories.txt"
+        local a
+        for a in "${ADVISORIES[@]}"; do
+            printf '%s\n' "$a" >> "$SESSION/final/advisories.txt"
+        done
+    fi
+}
+
+attr_value() {
+    local file="$1" id="$2" v
+    v="$(jq -r --argjson id "$id" '
+        .ata_smart_attributes.table[]? |
+        select(.id == $id) |
+        .raw.value' "$file" 2>/dev/null | head -n1)"
+    if [[ -z "$v" || "$v" == "null" ]]; then
+        echo "NA"
+    else
+        echo "$v"
+    fi
+}
+
+health_value() {
+    local file="$1"
+    jq -r '.smart_status.passed // "NA"' "$file" 2>/dev/null
+}
+
+# Detect mounted descendants, swap, dm/RAID holders, and roots whose backing
+# devices cannot be mapped.  This gate is re-run immediately before writes.
+check_target_safe() {
+    local mounts part holder src src_real mp
+    mounts="$(lsblk -nr -o MOUNTPOINTS "$DEV" | sed '/^$/d')"
+    if [[ -n "$mounts" ]]; then
+        echo "REFUSING: target or a descendant is mounted/in swap: $mounts" >&2
+        return 1
+    fi
+    # Existing device-mapper, mdraid and similar consumers can have no mount
+    # on the underlying disk and must never be overwritten behind their back.
+    for part in /sys/class/block/"$NAME" /sys/class/block/"$NAME"[0-9]* /sys/class/block/"$NAME"p[0-9]*; do
+        [[ -d "$part/holders" ]] || continue
+        for holder in "$part"/holders/*; do
+            [[ -e "$holder" ]] || continue
+            echo "REFUSING: $(basename "$part") has active holder $(basename "$holder")." >&2
+            return 1
+        done
+    done
+    for mp in / /boot /boot/efi /drivequal; do
+        src="$(findmnt -n -o SOURCE -T "$mp" 2>/dev/null || true)"
+        [[ -n "$src" ]] || {
+            echo "REFUSING: cannot determine backing device for $mp." >&2
+            return 1
+        }
+        # Restrict release-candidate execution to a conventional local block
+        # root/log filesystem.  Exotic overlay/network root needs review.
+        if [[ ! -b "$src" ]]; then
+            echo "REFUSING: $mp is backed by unmappable source '$src'." >&2
+            return 1
+        fi
+        src_real="$(readlink -f "$src")"
+        if lsblk -sno PATH "$src_real" 2>/dev/null | grep -Fxq "$DEV"; then
+            echo "REFUSING: target backs $mp ($src)." >&2
+            return 1
+        fi
+    done
+    return 0
+}
+
+verify_identity() {
+    check_target_safe || return 1
+    if [[ ! -b "$BYID" ]]; then
+        echo "ERROR: Stable device path disappeared: $BYID"
+        return 1
+    fi
+
+    local current_dev current_serial current_size current_model current_mounts
+    current_dev="$(readlink -f "$BYID")"
+
+    if [[ "$current_dev" != "$DEV" ]]; then
+        echo "IDENTITY FAILURE: stable path now resolves to $current_dev, expected $DEV"
+        return 1
+    fi
+
+    current_size="$(blockdev --getsize64 "$current_dev" 2>/dev/null || echo 0)"
+    if [[ "$current_size" != "$BYTES" ]]; then
+        echo "IDENTITY FAILURE: device size changed from $BYTES to $current_size bytes"
+        return 1
+    fi
+
+    current_model="$(lsblk -dn -o MODEL "$current_dev" | xargs)"
+    if [[ -n "$MODEL" && "$current_model" != "$MODEL" ]]; then
+        echo "IDENTITY FAILURE: model changed from '$MODEL' to '$current_model'"
+        return 1
+    fi
+
+    if [[ -n "$SERIAL" ]]; then
+        current_serial="$(lsblk -dn -o SERIAL "$current_dev" | xargs)"
+        if [[ "$current_serial" != "$SERIAL" ]]; then
+            echo "IDENTITY FAILURE"
+            echo "Expected serial: $SERIAL"
+            echo "Current serial:  $current_serial"
+            return 1
+        fi
+    fi
+
+    current_mounts="$(lsblk -nr -o MOUNTPOINTS "$current_dev" | sed '/^$/d')"
+    if [[ -n "$current_mounts" ]]; then
+        echo "ERROR: Target became mounted:"
+        echo "$current_mounts"
+        return 1
+    fi
+
+    return 0
+}
+
+ensure_log_writable() {
+    local testfile="$SESSION/.write-test.$$"
+    if ! printf '%s\n' "$(date --iso-8601=seconds)" > "$testfile" 2>/dev/null; then
+        echo "ERROR: Session logging location is not writable: $SESSION"
+        return 1
+    fi
+    rm -f "$testfile"
+    return 0
+}
+
+finish_result() {
+    local result="$1" reason="$2" dest target
+
+    set_stage FINAL
+    record_temp_once || true
+    stop_temp_logger
+    write_advisories
+
+    case "$result" in
+        PASS)   dest="/drivequal/completed" ;;
+        REVIEW) dest="/drivequal/review" ;;
+        REJECT) dest="/drivequal/rejected" ;;
+        *)      dest="/drivequal/review"; result="REVIEW" ;;
+    esac
+
+    mkdir -p "$dest"
+
+    {
+        echo "Result: $result"
+        echo "Reason: $reason"
+        echo "Completed: $(date --iso-8601=seconds)"
+        echo "Model: $MODEL"
+        echo "Serial: ${SERIAL:-unavailable}"
+        echo "Source: $SOURCE"
+        echo "Media: $MEDIA"
+        echo "Transport: ${TRAN:-unknown}"
+        echo "Stable ID: $BYID"
+        echo "Bytes: $BYTES"
+        echo "Advisories: ${#ADVISORIES[@]}"
+    } > "$SESSION/final/result.txt"
+
+    echo
+    echo "############################################################"
+    echo "### DRIVEQUAL RESULT: $result"
+    echo "### $reason"
+    if (( ${#ADVISORIES[@]} > 0 )); then
+        echo "### Advisories: ${#ADVISORIES[@]} (see final/advisories.txt)"
+    fi
+    echo "############################################################"
+    echo
+
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        chown -R "$SUDO_USER":"$SUDO_USER" "$SESSION" 2>/dev/null || true
+    fi
+
+    target="$dest/$BASENAME"
+    if [[ -e "$target" ]]; then
+        echo "ERROR: Final destination already exists: $target; preserving active records." >&2
+        exit 99
+    fi
+    if mv -T --no-clobber "$SESSION" "$target"; then
+        SESSION="$target"
+        FINALIZED=1
+        echo "Final records:"
+        echo "$SESSION"
+    else
+        echo "ERROR: Could not move final session to $target" >&2
+        echo "Session remains at: $SESSION" >&2
+        exit 99
+    fi
+}
+
+cleanup() {
+    local rc=$?
+    trap - EXIT INT TERM HUP
+    stop_temp_logger
+    rm -f "$STATEFILE" "${STATEFILE}.tmp.$$" "$TEMPSTATE" "${TEMPSTATE}.tmp."* 2>/dev/null || true
+
+    if (( FINALIZED == 0 )) && [[ -d "$SESSION" ]]; then
+        local ended_stage
+        ended_stage="$(cat "$STAGEFILE" 2>/dev/null || echo "$STAGE")"
+        {
+            echo "Abnormal termination"
+            echo "Time: $(date --iso-8601=seconds)"
+            echo "Exit status: $rc"
+            echo "Stage: $ended_stage"
+            echo "Device: $DEV"
+            echo "Model: $MODEL"
+            echo "Serial: ${SERIAL:-unavailable}"
+            echo "Stable ID: $BYID"
+        } > "$SESSION/final/abnormal-termination.txt" 2>/dev/null || true
+
+        echo >&2
+        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
+        echo "!!! DRIVEQUAL ABNORMAL TERMINATION" >&2
+        echo "!!! Exit status: $rc" >&2
+        echo "!!! Stage: $ended_stage" >&2
+        echo "!!! Serial: ${SERIAL:-unavailable}" >&2
+        echo "!!! Session retained for review:" >&2
+        echo "!!! $SESSION" >&2
+        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
+        echo >&2
+
+        if [[ -n "${SUDO_USER:-}" ]]; then
+            chown -R "$SUDO_USER":"$SUDO_USER" "$SESSION" 2>/dev/null || true
+        fi
+    fi
+
+    exit "$rc"
+}
+
+trap cleanup EXIT
+trap 'echo; echo "INTERRUPTED by operator or terminal signal."; exit 130' INT TERM HUP
+
+# ------------------------------------------------------------
+# Register the qualifier and ensure one shared host logger exists.
+# ------------------------------------------------------------
+check_target_safe || {
+    finish_result REVIEW "The target failed the boot/log/mount/holder safety gate."
+    exit 2
+}
+set_stage BASELINE
+{
+    echo "timestamp=$(date --iso-8601=seconds)"
+    echo "temp_c=NA"
+} > "$TEMPSTATE"
+
+if [[ -x "$HOSTMON" ]]; then
+    # The shared monitor must not inherit this drive's flock descriptor.
+    nohup "$HOSTMON" 8>&- >/dev/null 2>&1 &
+else
+    echo "WARNING: $HOSTMON is not installed; qualification will continue without shared host logging."
+fi
+
+# ============================================================
+# STAGE 1: BASELINE
+# ============================================================
+echo
+echo "Session: $SESSION"
+echo
+echo "----- BASELINE -----"
+
+{
+    echo "Drive Qualification Session"
+    echo
+    echo "Version:    $VERSION"
+    echo "Started:    $(date --iso-8601=seconds)"
+    echo "Source:     $SOURCE"
+    echo "Launch dev: $DEV"
+    echo "Stable ID:  $BYID"
+    echo "Model:      $MODEL"
+    echo "Serial:     ${SERIAL:-unavailable}"
+    echo "Size:       $SIZE"
+    echo "Bytes:      $BYTES"
+    echo "Transport:  ${TRAN:-unknown}"
+    echo "Media:      $MEDIA"
+    echo "Rotational: $ROTA"
+} > "$SESSION/baseline/identity.txt"
+
+lsblk -o NAME,PATH,MODEL,SERIAL,SIZE,ROTA,TRAN,FSTYPE,LABEL,MOUNTPOINTS \
+    > "$SESSION/baseline/lsblk.txt"
+
+udevadm info --query=property --name "$DEV" \
+    > "$SESSION/baseline/udev.txt" 2>&1 || true
+
+fdisk -l "$BYID" \
+    > "$SESSION/baseline/fdisk.txt" 2>&1 || true
+
+wipefs -n "$BYID" \
+    > "$SESSION/baseline/wipefs.txt" 2>&1 || true
+
+if [[ "$TRAN" == "sata" ]]; then
+    echo "Capturing hdparm identity/security..."
+    hdparm -I "$BYID" > "$SESSION/baseline/hdparm-I.txt" 2>&1
+    HDPARM_RC=$?
+
+    if (( HDPARM_RC != 0 )); then
+        finish_result REVIEW "hdparm identity/security capture failed."
+        exit 2
+    fi
+
+    if grep -Eq '^[[:space:]]+enabled[[:space:]]*$' "$SESSION/baseline/hdparm-I.txt"; then
+        finish_result REVIEW "ATA security is enabled."
+        exit 2
+    fi
+
+    if grep -Eq '^[[:space:]]+locked[[:space:]]*$' "$SESSION/baseline/hdparm-I.txt"; then
+        finish_result REVIEW "ATA security is locked."
+        exit 2
+    fi
+
+    echo "ATA security check: clear"
+else
+    echo "ATA hdparm security gate: skipped for transport ${TRAN:-unknown}"
+fi
+
+echo "Capturing baseline SMART..."
+smartctl -x "$BYID" > "$SESSION/baseline/smartctl-x.txt" 2>&1
+SMART_TEXT_RC=$?
+smartctl -x -j "$BYID" > "$SESSION/baseline/smartctl-x.json" 2>&1
+SMART_JSON_RC=$?
+printf 'text_exit=%s\njson_exit=%s\n' "$SMART_TEXT_RC" "$SMART_JSON_RC" > "$SESSION/baseline/smartctl-exit-status.txt"
+# smartctl status is a BITMASK, not a simple success/failure boolean.
+# A checksum defect alone (bit 2) does not mean a drive is unusable.
+if [[ "$TRAN" == "sata" ]] && (( (SMART_JSON_RC & 3) != 0 )); then
+    finish_result REVIEW "Baseline SMART command could not reliably communicate with direct SATA device (exit $SMART_JSON_RC)."
+    exit 2
+fi
+
+if jq empty "$SESSION/baseline/smartctl-x.json" >/dev/null 2>&1; then
+    if jq -e '
+        (.smart_support.available == true) or
+        (.smart_status.passed != null) or
+        (.nvme_smart_health_information_log != null)
+    ' "$SESSION/baseline/smartctl-x.json" >/dev/null 2>&1; then
+        SMART_CAPABLE=1
+    fi
+fi
+
+if [[ "$TRAN" == "sata" && "$SMART_CAPABLE" -ne 1 ]]; then
+    finish_result REVIEW "Direct SATA drive did not provide usable SMART data."
+    exit 2
+fi
+
+BASE_HEALTH="NA"
+BASE_REALLOC="NA"
+BASE_REPORTED="NA"
+BASE_PENDING="NA"
+BASE_OFFLINE="NA"
+BASE_CRC="NA"
+
+if (( SMART_CAPABLE == 1 )); then
+    BASE_HEALTH="$(health_value "$SESSION/baseline/smartctl-x.json")"
+    BASE_REALLOC="$(attr_value "$SESSION/baseline/smartctl-x.json" 5)"
+    BASE_REPORTED="$(attr_value "$SESSION/baseline/smartctl-x.json" 187)"
+    BASE_PENDING="$(attr_value "$SESSION/baseline/smartctl-x.json" 197)"
+    BASE_OFFLINE="$(attr_value "$SESSION/baseline/smartctl-x.json" 198)"
+    BASE_CRC="$(attr_value "$SESSION/baseline/smartctl-x.json" 199)"
+
+    echo
+    echo "Baseline health:              $BASE_HEALTH"
+    echo "Baseline reallocations:       $BASE_REALLOC"
+    echo "Baseline reported uncorrect:  $BASE_REPORTED"
+    echo "Baseline pending:             $BASE_PENDING"
+    echo "Baseline offline uncorrect:   $BASE_OFFLINE"
+    echo "Baseline CRC errors:          $BASE_CRC"
+    echo
+
+    if [[ "$BASE_HEALTH" == "false" ]] || (( (SMART_JSON_RC & 8) != 0 )); then
+        finish_result REJECT "SMART overall health reports failure."
+        exit 3
+    fi
+    if [[ "$TRAN" == "sata" && "$BASE_HEALTH" != "true" ]]; then
+        finish_result REVIEW "Direct SATA SMART overall health was not a confirmed PASS."
+        exit 2
+    fi
+    if (( (SMART_JSON_RC & 16) != 0 )); then
+        finish_result REJECT "SMART reported a current pre-failure attribute at or below threshold."
+        exit 3
+    fi
+    if (( (SMART_JSON_RC & 4) != 0 )); then
+        add_review_advisory "SMART reported a command/checksum issue in baseline; inspect smartctl-exit-status.txt and raw log."
+    fi
+    if (( (SMART_JSON_RC & 32) != 0 )); then
+        add_review_advisory "SMART reports historical threshold failure; inspect raw SMART attributes."
+    fi
+    if (( (SMART_JSON_RC & 64) != 0 )); then
+        add_review_advisory "SMART device error log contains entries; determine whether historical or current."
+    fi
+    if (( (SMART_JSON_RC & 128) != 0 )); then
+        add_review_advisory "SMART self-test log contains failure history; determine whether superseded by a clean extended test."
+    fi
+
+    if [[ "$BASE_PENDING" =~ ^[0-9]+$ ]] && (( BASE_PENDING > 0 )); then
+        finish_result REVIEW "Current pending sectors present at baseline."
+        exit 2
+    fi
+
+    if [[ "$BASE_OFFLINE" =~ ^[0-9]+$ ]] && (( BASE_OFFLINE > 0 )); then
+        finish_result REVIEW "Offline uncorrectable sectors present at baseline."
+        exit 2
+    fi
+
+    start_temp_logger
+else
+    printf 'timestamp,stage,temp_c\n' > "$TEMPLOG"
+    echo "SMART unavailable. Temperature telemetry is unavailable for this device."
+fi
+
+# ============================================================
+# STAGE 2A: DESTRUCTIVE WRITEABILITY PREFLIGHT
+#
+# drivequal invocation already authorizes destruction.  Before
+# spending hours on a SMART long test, prove that a direct-attached
+# target can actually accept and return a tiny write.  This destroys
+# the first 4096 bytes of the target.
+# USB media use f3probe below as their destructive preflight.
+# ============================================================
+# All destructive media profiles, including USB, first need writable status.
+verify_identity || {
+    finish_result REVIEW "Identity/safety check failed before destructive preflight."
+    exit 2
+}
+KERNEL_RO="$(blockdev --getro "$BYID" 2>/dev/null || echo unknown)"
+if [[ "$KERNEL_RO" != "0" ]]; then
+    finish_result REVIEW "Block device is read-only or its write status is unknown ($KERNEL_RO); no destructive probe attempted."
+    exit 2
+fi
+
+if [[ "$TRAN" != "usb" ]]; then
+    set_stage WRITE_PROBE
+    echo
+    echo "----- DESTRUCTIVE WRITEABILITY PREFLIGHT -----"
+    echo "Testing the first 4096 bytes before the SMART long test."
+
+    verify_identity || {
+        finish_result REVIEW "Identity verification failed before writeability preflight."
+        exit 2
+    }
+
+    ensure_log_writable || {
+        finish_result REVIEW "Logging destination became unwritable before writeability preflight."
+        exit 2
+    }
+
+    PROBELOG="$SESSION/probe/writeability-preflight.txt"
+    : > "$PROBELOG"
+
+    {
+        echo "Started: $(date --iso-8601=seconds)"
+        echo "Stable ID: $BYID"
+        echo "Serial: ${SERIAL:-unavailable}"
+        echo "Kernel read-only state:"
+    } >> "$PROBELOG"
+
+    KERNEL_RO="$(blockdev --getro "$BYID" 2>>"$PROBELOG" || echo 1)"
+    echo "blockdev --getro: $KERNEL_RO" >> "$PROBELOG"
+
+    if [[ "$KERNEL_RO" != "0" ]]; then
+        finish_result REVIEW "Target is read-only at the kernel/block-device layer. SMART long test was not started."
+        exit 2
+    fi
+
+    if [[ "$TRAN" == "sata" || "$TRAN" == "scsi" ]]; then
+        echo >> "$PROBELOG"
+        echo "hdparm read-only state:" >> "$PROBELOG"
+        hdparm -r "$BYID" >> "$PROBELOG" 2>&1 || true
+        if grep -Eq 'readonly[[:space:]]*=[[:space:]]*1[[:space:]]*\\(on\\)' "$PROBELOG"; then
+            finish_result REVIEW "Target reports ATA read-only mode. SMART long test was not started."
+            exit 2
+        fi
+    fi
+
+    echo >> "$PROBELOG"
+    echo "Writing 4096 zero bytes at LBA 0..." >> "$PROBELOG"
+
+    if ! dd if=/dev/zero \
+        of="$BYID" \
+        bs=4096 \
+        count=1 \
+        conv=fsync,notrunc \
+        status=none \
+        >> "$PROBELOG" 2>&1; then
+
+        finish_result REVIEW "Initial 4096-byte destructive writeability probe failed. SMART long test was not started."
+        exit 2
+    fi
+
+    blockdev --flushbufs "$BYID" >> "$PROBELOG" 2>&1 || true
+
+    echo "Reading and verifying the same 4096 bytes..." >> "$PROBELOG"
+
+    dd if="$BYID" \
+       bs=4096 \
+       count=1 \
+       iflag=direct \
+       status=none \
+       2>> "$PROBELOG" \
+     | cmp -n 4096 - /dev/zero >> "$PROBELOG" 2>&1
+
+    PIPE_RC=("${PIPESTATUS[@]}")
+    PROBE_READ_RC="${PIPE_RC[0]}"
+    PROBE_CMP_RC="${PIPE_RC[1]}"
+
+    {
+        echo "probe read exit status: $PROBE_READ_RC"
+        echo "probe compare exit status: $PROBE_CMP_RC"
+    } >> "$PROBELOG"
+
+    if (( PROBE_READ_RC != 0 || PROBE_CMP_RC != 0 )); then
+        finish_result REVIEW "Initial destructive write succeeded but immediate read verification failed. SMART long test was not started."
+        exit 2
+    fi
+
+    echo "Writeability preflight: PASSED"
+fi
+
+# ============================================================
+# STAGE 2B: USB CAPACITY / FRAUD PROBE
+# ============================================================
+if [[ "$TRAN" == "usb" ]]; then
+    set_stage PROBE
+    echo
+    echo "----- USB CAPACITY / INTEGRITY PROBE -----"
+
+    if ! command -v f3probe >/dev/null 2>&1; then
+        finish_result REVIEW "USB qualification requires f3probe. Install Debian package 'f3' and rerun."
+        exit 2
+    fi
+
+    verify_identity || {
+        finish_result REVIEW "Identity verification failed before USB probe."
+        exit 2
+    }
+
+    ensure_log_writable || {
+        finish_result REVIEW "Logging destination became unwritable before USB probe."
+        exit 2
+    }
+
+    f3probe --destructive --time-ops "$BYID" 2>&1 | tee "$SESSION/probe/f3probe.txt"
+    PIPE_RC=("${PIPESTATUS[@]}")
+    F3_RC="${PIPE_RC[0]}"
+    F3_TEE_RC="${PIPE_RC[1]}"
+
+    if (( F3_TEE_RC != 0 )); then
+        finish_result REVIEW "USB probe ran, but its log could not be written reliably."
+        exit 2
+    fi
+
+    if (( F3_RC != 0 )); then
+        finish_result REJECT "f3probe reported damaged/counterfeit USB media (exit $F3_RC)."
+        exit 3
+    fi
+
+    F3_PASSED=1
+    echo "USB capacity/integrity probe: PASSED"
+fi
+
+# ============================================================
+# STAGE 2C: SMART LONG TEST FOR DIRECT SATA HDD/SSD
+# ============================================================
+if [[ "$TRAN" == "sata" && "$SMART_CAPABLE" -eq 1 ]]; then
+    set_stage LONG
+    record_temp_once || true
+    echo
+    echo "----- SMART LONG TEST -----"
+
+    verify_identity || {
+        finish_result REVIEW "Identity verification failed before SMART long test."
+        exit 2
+    }
+
+    smartctl -t long "$BYID" > "$SESSION/long-test/start.txt" 2>&1
+    LONG_START_RC=$?
+    cat "$SESSION/long-test/start.txt"
+
+    if grep -qiE 'Testing has begun|Self-test.*begun|Drive command .*successful' "$SESSION/long-test/start.txt"; then
+        LONG_RAN=1
+        SAW_LONG_PROGRESS=0
+        echo
+        echo "Monitoring SMART extended test..."
+        LONG_MINUTES="$(sed -nE 's/.*Please wait ([0-9]+) minutes.*/\1/p' "$SESSION/long-test/start.txt" | head -n1)"
+        if [[ "$LONG_MINUTES" =~ ^[0-9]+$ ]] && (( LONG_MINUTES > 0 )); then
+            LONG_DEADLINE=$(( SECONDS + LONG_MINUTES * 180 + 7200 ))
+        else
+            LONG_DEADLINE=$(( SECONDS + 604800 ))  # seven days when firmware supplies no estimate
+        fi
+        sleep 5
+
+        while true; do
+            if (( SECONDS > LONG_DEADLINE )); then
+                finish_result REVIEW "SMART long monitor exceeded conservative watchdog; test may still be running in drive firmware."
+                exit 2
+            fi
+            NOW="$(date --iso-8601=seconds)"
+            STATUS="$(smartctl -c "$BYID" 2>&1 || true)"
+
+            {
+                echo
+                echo "===== $NOW ====="
+                echo "$STATUS"
+            } >> "$SESSION/long-test/status.log"
+
+            if echo "$STATUS" | grep -qi "self-test routine in progress"; then
+                SAW_LONG_PROGRESS=1
+                PCT="$(echo "$STATUS" |
+                    grep -i -A2 'Self-test execution status' |
+                    grep -oE '[0-9]+% of test remaining' |
+                    head -n1 || true)"
+                TEMP="$(get_temp)"
+                echo "Long test running  Temp=${TEMP}C  ${PCT:-}"
+                sleep 60
+            else
+                echo "SMART long test no longer reports as running."
+                break
+            fi
+        done
+
+        record_temp_once || true
+        stage_temp_summary LONG "$SESSION/long-test/temperature-summary.txt"
+
+        smartctl -x "$BYID" > "$SESSION/long-test/smart-after-long.txt" 2>&1 || true
+        smartctl -x -j "$BYID" > "$SESSION/long-test/smart-after-long.json" 2>&1 || true
+
+        LONG_LINE="$(grep -E '^# *1 .*Extended' "$SESSION/long-test/smart-after-long.txt" | head -n1 || true)"
+
+        echo
+        echo "Newest extended-test result:"
+        echo "${LONG_LINE:-No parseable extended-test result found}"
+        echo
+
+        if [[ "$MEDIA" == "HDD" && "$SAW_LONG_PROGRESS" -ne 1 ]]; then
+            finish_result REVIEW "SMART extended test was started but no in-progress state was observed on this HDD."
+            exit 2
+        elif [[ -n "$LONG_LINE" ]] && echo "$LONG_LINE" | grep -qi "Completed without error"; then
+            LONG_VALID=1
+        elif [[ -n "$LONG_LINE" ]] && echo "$LONG_LINE" | grep -qiE 'read failure|failure|uncorrectable|error'; then
+            finish_result REJECT "SMART extended test failed."
+            exit 3
+        elif [[ "$MEDIA" == "SSD" ]] &&
+             grep -A2 -i 'Self-test execution status:' "$SESSION/long-test/smart-after-long.txt" | grep -qi 'without error'; then
+            add_review_advisory "SSD extended SMART test ended without a parseable extended-test history entry. This is incomplete SMART evidence, not an automatic media failure."
+        else
+            finish_result REVIEW "SMART extended test result could not be validated."
+            exit 2
+        fi
+
+        if ! jq empty "$SESSION/long-test/smart-after-long.json" >/dev/null 2>&1; then
+            finish_result REVIEW "SMART JSON became unreadable after the extended test."
+            exit 2
+        fi
+
+        AFTER_LONG_PENDING="$(attr_value "$SESSION/long-test/smart-after-long.json" 197)"
+        AFTER_LONG_OFFLINE="$(attr_value "$SESSION/long-test/smart-after-long.json" 198)"
+
+        if [[ "$AFTER_LONG_PENDING" =~ ^[0-9]+$ ]] && (( AFTER_LONG_PENDING > 0 )); then
+            finish_result REVIEW "Pending sectors remain after SMART extended test."
+            exit 2
+        fi
+
+        if [[ "$AFTER_LONG_OFFLINE" =~ ^[0-9]+$ ]] && (( AFTER_LONG_OFFLINE > 0 )); then
+            finish_result REVIEW "Offline uncorrectable sectors remain after SMART extended test."
+            exit 2
+        fi
+
+        if (( REVIEW_ADVISORY == 1 )); then
+            echo "Pre-write SMART gate: PASSED with REVIEW advisory"
+        else
+            echo "Pre-write SMART gate: PASSED"
+        fi
+    elif [[ "$MEDIA" == "SSD" ]] &&
+         grep -qiE 'not supported|unsupported|does not support' "$SESSION/long-test/start.txt"; then
+        echo "SMART extended self-test is not supported by this SSD; continuing with full write/read qualification."
+    else
+        echo "smartctl start exit status: $LONG_START_RC"
+        finish_result REVIEW "SMART extended test could not be confirmed as started."
+        exit 2
+    fi
+else
+    echo
+    echo "----- PRE-WRITE DEVICE CHECK -----"
+    echo "SMART extended test skipped for ${TRAN:-unknown} $MEDIA media."
+fi
+
+# ============================================================
+# STAGE 3: FULL ZERO WRITE
+# One complete SSD write is intentional qualification/sanitize,
+# not repeated endurance burn-in.
+# ============================================================
+set_stage ZERO_WRITE
+record_temp_once || true
+
+echo
+echo "----- FULL ZERO WRITE -----"
+echo "Target serial:   ${SERIAL:-unavailable}"
+echo "Target identity: $BYID"
+echo
+
+verify_identity || {
+    finish_result REVIEW "Identity verification failed before zero write."
+    exit 2
+}
+
+ensure_log_writable || {
+    finish_result REVIEW "Logging destination became unwritable before zero write."
+    exit 2
+}
+
+{
+    echo "Started: $(date --iso-8601=seconds)"
+    echo "Stable ID: $BYID"
+    echo "Serial: ${SERIAL:-unavailable}"
+    echo "Media: $MEDIA"
+    echo "Bytes expected: $BYTES"
+} > "$SESSION/zero-write/metadata.txt"
+
+dd if=/dev/zero \
+   of="$BYID" \
+   bs=16M \
+   count="$BYTES" \
+   iflag=count_bytes \
+   conv=fsync \
+   status=progress \
+   2>&1 | tee "$SESSION/zero-write/zero-write.log"
+PIPE_RC=("${PIPESTATUS[@]}")
+WRITE_RC="${PIPE_RC[0]}"
+WRITE_TEE_RC="${PIPE_RC[1]}"
+
+{
+    echo "dd exit status: $WRITE_RC"
+    echo "tee exit status: $WRITE_TEE_RC"
+} >> "$SESSION/zero-write/zero-write.log"
+
+record_temp_once || true
+stage_temp_summary ZERO_WRITE "$SESSION/zero-write/temperature-summary.txt"
+
+if (( WRITE_TEE_RC != 0 )); then
+    finish_result REVIEW "Zero write ran, but its log could not be written reliably."
+    exit 2
+fi
+
+if (( WRITE_RC != 0 )); then
+    finish_result REJECT "Full-device zero write failed."
+    exit 3
+fi
+
+echo "Full-device zero write: PASSED"
+sync
+partprobe "$BYID" 2>/dev/null || true
+
+# ============================================================
+# STAGE 4: FULL READBACK + ZERO VERIFICATION
+# The readback now proves both readability and that every byte
+# returned from the sanitized device is zero.
+# ============================================================
+set_stage READBACK
+record_temp_once || true
+
+echo
+echo "----- FULL READBACK / ZERO VERIFY -----"
+
+verify_identity || {
+    finish_result REVIEW "Identity verification failed before readback."
+    exit 2
+}
+
+ensure_log_writable || {
+    finish_result REVIEW "Logging destination became unwritable before readback."
+    exit 2
+}
+
+READLOG="$SESSION/readback/readback.log"
+: > "$READLOG"
+
+dd if="$BYID" \
+   bs=16M \
+   count="$BYTES" \
+   iflag=direct,count_bytes \
+   status=progress \
+   2> >(tee -a "$READLOG" >&2) \
+ | cmp -n "$BYTES" - /dev/zero >> "$READLOG" 2>&1
+PIPE_RC=("${PIPESTATUS[@]}")
+READ_RC="${PIPE_RC[0]}"
+CMP_RC="${PIPE_RC[1]}"
+
+{
+    echo "dd exit status: $READ_RC"
+    echo "cmp zero-verify exit status: $CMP_RC"
+} >> "$READLOG"
+
+record_temp_once || true
+stage_temp_summary READBACK "$SESSION/readback/temperature-summary.txt"
+
+if (( READ_RC != 0 )); then
+    finish_result REJECT "Full-device sequential readback failed."
+    exit 3
+fi
+
+if (( CMP_RC != 0 )); then
+    finish_result REJECT "Readback completed but returned non-zero data after the zero sanitize pass."
+    exit 3
+fi
+
+echo "Full-device readback and zero verification: PASSED"
+
+# ============================================================
+# STAGE 5: POST-WRITE SMART SHORT TEST
+# ============================================================
+if [[ "$TRAN" == "sata" && "$SMART_CAPABLE" -eq 1 ]]; then
+    verify_identity || {
+        finish_result REVIEW "Identity/safety gate failed before post-write SMART short."
+        exit 2
+    }
+    set_stage SHORT
+    record_temp_once || true
+    echo
+    echo "----- SMART SHORT TEST -----"
+
+    smartctl -t short "$BYID" > "$SESSION/short-test/start.txt" 2>&1
+    SHORT_START_RC=$?
+    cat "$SESSION/short-test/start.txt"
+
+    if grep -qiE 'Testing has begun|Self-test.*begun|Drive command .*successful' "$SESSION/short-test/start.txt"; then
+        SHORT_RAN=1
+        SHORT_DEADLINE=$(( SECONDS + 7200 ))
+        sleep 5
+
+        while true; do
+            if (( SECONDS > SHORT_DEADLINE )); then
+                finish_result REVIEW "SMART short monitor exceeded two-hour watchdog; self-test may remain active in firmware."
+                exit 2
+            fi
+            NOW="$(date --iso-8601=seconds)"
+            STATUS="$(smartctl -c "$BYID" 2>&1 || true)"
+            {
+                echo
+                echo "===== $NOW ====="
+                echo "$STATUS"
+            } >> "$SESSION/short-test/status.log"
+
+            if echo "$STATUS" | grep -qi "self-test routine in progress"; then
+                echo "SMART short test running..."
+                sleep 15
+            else
+                break
+            fi
+        done
+
+        record_temp_once || true
+        stage_temp_summary SHORT "$SESSION/short-test/temperature-summary.txt"
+    elif [[ "$MEDIA" == "SSD" ]] &&
+         grep -qiE 'not supported|unsupported|does not support' "$SESSION/short-test/start.txt"; then
+        echo "SMART short self-test is not supported by this SSD; continuing."
+    else
+        echo "smartctl start exit status: $SHORT_START_RC"
+        finish_result REVIEW "SMART short test could not be confirmed as started."
+        exit 2
+    fi
+fi
+
+# ============================================================
+# STAGE 6: FINAL SMART / DELTA / CLASSIFICATION
+# ============================================================
+set_stage FINAL
+record_temp_once || true
+verify_identity || {
+    finish_result REVIEW "Identity/safety gate failed before final SMART."
+    exit 2
+}
+
+echo
+echo "----- FINAL -----"
+
+smartctl -x "$BYID" > "$SESSION/final/smartctl-x.txt" 2>&1
+FINAL_SMART_TEXT_RC=$?
+smartctl -x -j "$BYID" > "$SESSION/final/smartctl-x.json" 2>&1
+FINAL_SMART_JSON_RC=$?
+printf 'text_exit=%s\njson_exit=%s\n' "$FINAL_SMART_TEXT_RC" "$FINAL_SMART_JSON_RC" > "$SESSION/final/smartctl-exit-status.txt"
+
+if (( SMART_CAPABLE != 1 )); then
+    if [[ "$TRAN" == "usb" && "$F3_PASSED" -eq 1 ]]; then
+        finish_result PASS \
+            "USB capacity probe and full logical zero-write/readback passed; SMART unavailable. Not a certified flash-media purge."
+        exit 0
+    fi
+    finish_result REVIEW \
+        "Full write/read verification completed, but this non-USB device did not provide usable SMART health data."
+    exit 2
+fi
+
+if ! jq empty "$SESSION/final/smartctl-x.json" >/dev/null 2>&1; then
+    finish_result REVIEW "Final SMART JSON was unreadable."
+    exit 2
+fi
+if [[ "$TRAN" == "sata" ]] && (( (FINAL_SMART_JSON_RC & 3) != 0 )); then
+    finish_result REVIEW "Final SMART communication/command failure; see final/smartctl-exit-status.txt."
+    exit 2
+fi
+if (( (FINAL_SMART_JSON_RC & 8) != 0 || (FINAL_SMART_JSON_RC & 16) != 0 )); then
+    finish_result REJECT "Final SMART status or a current pre-failure attribute reports failure."
+    exit 3
+fi
+if (( (FINAL_SMART_JSON_RC & 4) != 0 )); then
+    add_review_advisory "Final SMART command/checksum issue; result needs manual review."
+fi
+
+if (( SHORT_RAN == 1 )); then
+    SHORT_LINE="$(grep -E '^# *1 .*Short' "$SESSION/final/smartctl-x.txt" | head -n1 || true)"
+    echo "Newest short-test result:"
+    echo "${SHORT_LINE:-No parseable short-test result found}"
+
+    if [[ -n "$SHORT_LINE" ]] && echo "$SHORT_LINE" | grep -qi "Completed without error"; then
+        SHORT_VALID=1
+    elif [[ -n "$SHORT_LINE" ]] && echo "$SHORT_LINE" | grep -qiE 'read failure|failure|uncorrectable|error'; then
+        finish_result REJECT "Post-write SMART short test failed."
+        exit 3
+    elif [[ "$MEDIA" == "SSD" ]] &&
+         grep -A2 -i 'Self-test execution status:' "$SESSION/final/smartctl-x.txt" | grep -qi 'without error'; then
+        add_review_advisory "SSD short SMART test ended without a parseable short-test history entry."
+    else
+        finish_result REVIEW "Post-write SMART short test result could not be validated."
+        exit 2
+    fi
+else
+    echo "SMART short self-test was not run for this media profile."
+fi
+
+FINAL_HEALTH="$(health_value "$SESSION/final/smartctl-x.json")"
+FINAL_REALLOC="$(attr_value "$SESSION/final/smartctl-x.json" 5)"
+FINAL_REPORTED="$(attr_value "$SESSION/final/smartctl-x.json" 187)"
+FINAL_PENDING="$(attr_value "$SESSION/final/smartctl-x.json" 197)"
+FINAL_OFFLINE="$(attr_value "$SESSION/final/smartctl-x.json" 198)"
+FINAL_CRC="$(attr_value "$SESSION/final/smartctl-x.json" 199)"
+
+{
+    echo "SMART DELTA"
+    echo
+    printf '%-28s %-12s %-12s\n' "ATTRIBUTE" "BASELINE" "FINAL"
+    printf '%-28s %-12s %-12s\n' "SMART health" "$BASE_HEALTH" "$FINAL_HEALTH"
+    printf '%-28s %-12s %-12s\n' "Reallocated sectors" "$BASE_REALLOC" "$FINAL_REALLOC"
+    printf '%-28s %-12s %-12s\n' "Reported uncorrectable" "$BASE_REPORTED" "$FINAL_REPORTED"
+    printf '%-28s %-12s %-12s\n' "Current pending" "$BASE_PENDING" "$FINAL_PENDING"
+    printf '%-28s %-12s %-12s\n' "Offline uncorrectable" "$BASE_OFFLINE" "$FINAL_OFFLINE"
+    printf '%-28s %-12s %-12s\n' "UDMA CRC errors" "$BASE_CRC" "$FINAL_CRC"
+} > "$SESSION/final/delta.txt"
+
+cat "$SESSION/final/delta.txt"
+
+if [[ "$FINAL_HEALTH" == "false" ]]; then
+    finish_result REJECT "SMART overall health failed after qualification."
+    exit 3
+fi
+if [[ "$TRAN" == "sata" && "$FINAL_HEALTH" != "true" ]]; then
+    finish_result REVIEW "Final SMART health is unavailable; a PASS cannot be established."
+    exit 2
+fi
+
+if [[ "$FINAL_PENDING" =~ ^[0-9]+$ ]] && (( FINAL_PENDING > 0 )); then
+    finish_result REJECT "Pending sectors present after qualification."
+    exit 3
+fi
+
+if [[ "$FINAL_OFFLINE" =~ ^[0-9]+$ ]] && (( FINAL_OFFLINE > 0 )); then
+    finish_result REJECT "Offline uncorrectable sectors present after qualification."
+    exit 3
+fi
+
+if [[ "$BASE_REALLOC" =~ ^[0-9]+$ && "$FINAL_REALLOC" =~ ^[0-9]+$ ]] &&
+   (( FINAL_REALLOC > BASE_REALLOC )); then
+    finish_result REJECT "Reallocated-sector count increased during qualification."
+    exit 3
+fi
+
+if [[ "$BASE_REPORTED" =~ ^[0-9]+$ && "$FINAL_REPORTED" =~ ^[0-9]+$ ]] &&
+   (( FINAL_REPORTED > BASE_REPORTED )); then
+    finish_result REJECT "Reported-uncorrectable count increased during qualification."
+    exit 3
+fi
+
+if [[ "$BASE_CRC" =~ ^[0-9]+$ && "$FINAL_CRC" =~ ^[0-9]+$ ]] &&
+   (( FINAL_CRC > BASE_CRC )); then
+    finish_result REVIEW "UDMA CRC errors increased during qualification; inspect SATA path."
+    exit 2
+fi
+
+if [[ "$FINAL_REALLOC" =~ ^[0-9]+$ ]] && (( FINAL_REALLOC > 0 )); then
+    finish_result REVIEW "Qualification passed, but historical reallocated sectors are present."
+    exit 2
+fi
+
+if (( REVIEW_ADVISORY == 1 )); then
+    finish_result REVIEW "Full logical write/read verification succeeded, but SMART self-test evidence was incomplete."
+    exit 2
+fi
+
+if [[ "$TRAN" == "usb" ]]; then
+    finish_result PASS "USB probe and full logical zero-write/readback passed with available health checks; no flash purge is claimed."
+elif (( LONG_RAN == 1 && LONG_VALID == 1 && SHORT_RAN == 1 && SHORT_VALID == 1 )); then
+    finish_result PASS "Extended SMART, complete logical zero-write/readback, and post-write SMART completed cleanly."
+else
+    finish_result PASS "SMART health, supported self-tests, complete logical zero-write/readback, and final SMART completed cleanly."
+fi
+
+exit 0

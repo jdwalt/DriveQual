@@ -1,0 +1,15 @@
+DriveQual
+Copyright 2026 Jack Walter (copyrightable human contributions and selection/arrangement)
+
+DriveQual was conceived, directed, tested, and refined by Jack Walter.
+Source code and documentation were developed with AI assistance using
+OpenAI's ChatGPT. OpenAI is not a project maintainer or endorsing party.
+
+This project is distributed under the Apache License, Version 2.0.
+See the LICENSE file. The above copyright notice applies only to the
+extent that copyright protection exists and Jack Walter holds the rights.
+
+No third-party source-code libraries or binaries are included in this
+source repository. External programs called at runtime and the GitHub
+Actions workflow dependency retain their own licenses. See
+`docs/THIRD-PARTY.md` for the dependency inventory and review limits.

@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+# Never publish local qualification evidence or hardware inventories
+/active/
+/completed/
+/review/
+/rejected/
+/host-monitor/
+/drivequal-logs/
+/logs/
+*.log
+*.tar
+*.tar.gz
+*.zip
+*.csv
+*.json
+*.tmp
+*.bak
+*.swp
+.DS_Store
+__pycache__/
+.pytest_cache/
